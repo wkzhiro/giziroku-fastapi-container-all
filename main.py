@@ -2,9 +2,8 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import MeetingData
-from .models import json_file
-# import app.setting as setting 
+from models import MeetingData
+from models import json_file 
 
 import uvicorn
 import json
