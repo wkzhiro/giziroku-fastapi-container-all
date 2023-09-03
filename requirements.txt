@@ -17,4 +17,5 @@ fastapi
 python-multipart
 chardet
 imageio_ffmpeg
-sndfile
+SoundFile
+librosa
