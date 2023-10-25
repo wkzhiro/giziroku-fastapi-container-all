@@ -7,5 +7,8 @@ class MeetingData(BaseModel):
     purpose: str
     precision:str
 
+class MailData(BaseModel):
+    address : str
+
 class json_file(BaseModel):
     filename : str

@@ -2,8 +2,18 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from models import MeetingData
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import firestore
+from firebase_admin import storage
+#from google.cloud import storage
+
+from models import MeetingData,MailData
 from models import json_file 
+
+from dotenv import load_dotenv
+import os
+from os.path import join, dirname
 
 import uvicorn
 import json
@@ -30,13 +40,23 @@ from langchain import OpenAI, PromptTemplate, LLMChain
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.chains.summarize import load_summarize_chain
 from langchain.docstore.document import Document
-from langchain.chat_models import ChatOpenAI
+from langchain.chat_models import ChatOpenAI,AzureChatOpenAI
+
+import pickle
+import os.path
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import base64
+from email.mime.text import MIMEText
+from apiclient import errors
+
 
 app = FastAPI()
 
 #通信設定
 origins = [
-    "http://localhost:3000",
+    "*"
 ]
 
 app.add_middleware(
@@ -47,11 +67,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OA_KEY = setting.OA_KEY
-openai.api_key = OA_KEY 
-OPENAI_API_KEY = OA_KEY
+dotenv_path = join(dirname(__file__), '.env')
+load_dotenv(dotenv_path)
 
-# HG_KEY = setting.HG_KEY
+# OA_KEY = os.environ.get("OA_KEY")
+HG_KEY = os.environ.get("HG_KEY")
+
+# openai.api_key = OA_KEY 
+# OPENAI_API_KEY = OA_KEY
+
+openai.api_type = "azure"
+openai.api_base = os.environ.get("OPENAI_API_BASE")
+openai.api_version = "2023-07-01-preview"
+openai.api_key = os.environ.get("AZ_KEY")
+
+type = "service_account"
+project_id = os.environ.get("PROJECT_ID")
+private_key_id = os.environ.get("PRIVATE_KEY_ID")
+private_key = os.environ.get("PRIVATE_KEY").replace('\\n', '\n')
+client_email = os.environ.get("CLIENT_EMAIL")
+client_id = os.environ.get("CLIENT_ID")
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = os.environ.get("AUTH_PROVIDER_X509_CERT_URL")
+client_x509_cert_url = os.environ.get("CLIENT_X509_CERT_URL")
+
+cred = credentials.Certificate({
+    "type": type,
+    "project_id": project_id,
+    "private_key_id": private_key_id,
+    "private_key": private_key,
+    "client_email": client_email,
+    "client_id": client_id,
+    "auth_uri": auth_uri,
+    "token_uri": token_uri,
+    "auth_provider_x509_cert_url": auth_provider_x509_cert_url,
+    "client_x509_cert_url": client_x509_cert_url
+})
+
+FIREBASE_STORAGE_BUCKET=os.environ.get("FIREBASE_STORAGE_BUCKET")
+firebase_admin.initialize_app(cred,{'storageBucket':FIREBASE_STORAGE_BUCKET})
+bucket = storage.bucket()
+
+# root_path =  "/home/site/wwwroot/app/static"
+root_path = "static"
 
 def guess_encoding(text_bytes):
     result = chardet.detect(text_bytes)
@@ -75,8 +134,16 @@ def process_text(text_bytes):
     return None
 
 
-def summarize(text):
-    llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k-0613", temperature=0, max_tokens=8000, openai_api_key= OPENAI_API_KEY)
+def summarize(text,type="all"):
+    gpt_model = "gpt-35-turbo-16k"
+    llm = AzureChatOpenAI(
+    openai_api_base = openai.api_base,
+    openai_api_version=openai.api_version,
+    openai_api_key=openai.api_key,
+    deployment_name=gpt_model,
+    temperature=0, 
+    max_tokens=4000
+    )
     text_splitter = CharacterTextSplitter(separator = "\n",chunk_size=8000)
 
     texts = text_splitter.split_text(text)
@@ -102,7 +169,7 @@ def summarize(text):
     1.要点1
     2.要点2
     ----------------
-    このフォーマット外の出力はしないでください。
+    このフォーマット外の出力はせず、先頭に番号が付いた文字列だけ出力してください。
 
     【議事録】
     {text}
@@ -171,7 +238,7 @@ def summarize(text):
     
     # 回答の生成
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo-16k-0613",
+        engine=gpt_model,
         messages=[
             {"role": "user", "content": prompt},
         ],
@@ -200,7 +267,7 @@ def summarize(text):
         prompt = "次のテキストを200文字以内で要約してください：{}".format(t)
         # 回答の生成
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo-16k-0613",
+            engine="gpt-4",
             messages=[
                 {"role": "user", "content": prompt},
             ],
@@ -209,7 +276,10 @@ def summarize(text):
         # 文章の統合
         meeting_sum = meeting_sum + "# "+ title_list[i] +"\n"+ response.choices[0]["message"]["content"].strip() + "\n"
 
-    output =  "要約\n"+ meeting_sum + "\n" + "要点\n" + docs_sum
+    if type=="all":
+        output =  "要約\n"+ meeting_sum + "\n" + "要点\n" + docs_sum
+    else:
+        output =  "要約\n"+ meeting_sum
 
     return output
 
@@ -236,9 +306,9 @@ async def gettime_transcription(upload_file, d):
         video_length = get_video_duration(temp_file_path)
 
         precision = d["precision"]
-        if precision==0:
+        if precision=="low":
             predict_time = 3 * video_length/60
-        elif precision ==50:
+        elif precision =="middle":
             predict_time = 9 * video_length/60
 
         else:
@@ -258,10 +328,9 @@ async def get_time_transcription(upload_file, precision):
         
         video_length = get_video_duration(temp_file_path)
 
-        precision = precision
-        if precision=="低":
+        if precision=="low":
             predict_time = 3 * video_length/60
-        elif precision =="中":
+        elif precision =="middle":
             predict_time = 9 * video_length/60
 
         else:
@@ -286,11 +355,11 @@ async def transcription_whisper(upload_file, d):
         
         video_length = get_video_duration(temp_file_path)
 
-        if precision=="低":
+        if precision=="low":
             model = "small"
             predict_time = 3 * video_length/60
             print("終了時間予測：", str(predict_time), "分")
-        elif precision =="中":
+        elif precision =="middle":
             model = "medium"
             predict_time = 9 * video_length/60
             print("終了時間予測：", str(predict_time), "分")
@@ -321,11 +390,7 @@ async def transcription_whisper(upload_file, d):
 
         transcription = []
         transcription_all = ""
-        # transcription.append({"話者":"打合せ："+ title, "会話":""})
-        # transcription.append({"話者":"日付："+ str(date), "会話":""})
-        # transcription.append({"話者":"参加者："+ menber1 +"、" + menber2 +"、" + menber3, "会話":""})
-        # transcription.append({"話者":"目的："+ purpose, "会話":""})
-        
+
         for segment, _, speaker in diarization.itertracks(yield_label=True):
             transcription_speak = {}
             waveform, sample_rate = audio.crop(temp_file_wav, segment)
@@ -359,12 +424,13 @@ async def transcription_whisper(upload_file, d):
         return text_all, transcription_all
 
 
+
 @app.get("/")
 def index():
     return "Hello world"
 
-@app.post("/settings/")
-async def recieve(data:MeetingData):
+@app.post("/settings/{id}")
+async def recieve(id : str, data:MeetingData):
     title = data.title
     date = data.date
     member_list = ""
@@ -376,45 +442,41 @@ async def recieve(data:MeetingData):
     except:
         precision = ""
 
+    # Azure App Serviceでの保存ディレクトリ
+    save_dir  =  root_path + f"/{id}/param"
+    os.makedirs(save_dir, exist_ok=True)  # ディレクトリが存在しない場合は作成
     filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_settings.json"
-    path = f"app/static/param/{filename}"
-    
-    with open(path, "w") as f:
+
+    path = f"{save_dir}/{filename}"
+
+    with open(path, "w", encoding="shift-jis") as f:
         params = {"title":title, "date":date, "member":member_list, "purpose":purpose, "precision":precision}    
         json.dump(params, f)
 
     return filename
-
-@app.post("/open/")
-async def open_json(data:json_file):
-    print(data)
-    path = f"app/static/param/{data.filename}"
     
-    with open(path, "r", encoding="shift-jis") as f:
-        d = json.load(f)
-        print(d["title"])
-    
-    return d
-    
-@app.post("/gettime/{filename}")
-async def upload_file_gettime( filename : str, upload_file: UploadFile = File(...)):
-    path_setting = f"app/static/param/{filename}"
-    with open(path_setting, "r", encoding="shift-jis") as f:
-        d = json.load(f)
-
-    video_length, transcription_time= await gettime_transcription(upload_file, d)
-    return int(video_length), int(transcription_time)
-
 @app.post("/get_time/{precision}")
 async def uploadfile_get_time( precision : str, upload_file: UploadFile = File(...)):
     video_length, transcription_time= await get_time_transcription(upload_file, precision)
     return int(video_length), int(transcription_time)
 
-@app.post("/uploadfile/{filename}")
-async def upload_file( filename : str ,upload_file: UploadFile = File(...)):
-    print(filename)
+@app.post("/get_filename/{filename}")
+async def get_filename( filename : str ,upload_file: UploadFile = File(...)):
+    suffix = Path(upload_file.filename).suffix
+    if suffix == ".txt":
+        summary_filename = f"summary_{filename[:15]}_{upload_file.filename}"
+        transcription_filename = f"transcription_{filename[:15]}_{upload_file.filename}"
 
-    path_setting = f"app/static/param/{filename}"
+    elif suffix == ".mp4":
+        summary_filename = f"summary_{filename[:15]}_{upload_file.filename.replace('mp4', 'txt')}"
+        transcription_filename = f"transcription_{filename[:15]}_{upload_file.filename.replace('mp4', 'txt')}"
+    return [summary_filename, transcription_filename]
+
+@app.post("/uploadfile/{id}/{type}/{filename}")
+async def upload_file( id : str, type:str,filename : str ,upload_file: UploadFile = File(...)):
+    print(filename)
+    
+    path_setting = f"{root_path}/{id}/param/{filename}"
     with open(path_setting, "r", encoding="shift-jis") as f:
         d = json.load(f)
 
@@ -432,7 +494,7 @@ async def upload_file( filename : str ,upload_file: UploadFile = File(...)):
             print("content:",content)
             print("Path:",temp_path)
 
-            result = summarize(content)
+            result = summarize(content, type)
         
         summary=""
         summary+= "打合せ："+ d["title"] + "\n"
@@ -441,19 +503,29 @@ async def upload_file( filename : str ,upload_file: UploadFile = File(...)):
         summary+="目的："+ d["purpose"] + "\n"
         summary+= result
 
-        filename = f"summary_{datetime.now().strftime('%Y%m%d%H%M%S')}_{upload_file.filename}"
-        path_result = f"app/static/result/summary/{filename}"
+        filename = f"summary_{filename[:15]}_{upload_file.filename}"
 
-        with open(path_result, "w") as file:
+        save_dir =  root_path + f"/{id}/result/summary"
+        os.makedirs(save_dir, exist_ok=True)  # ディレクトリが存在しない場合は作成
+        path_result = f"{save_dir}/{filename}"
+
+        with open(path_result, "w", encoding="shift-jis") as file:
             file.write(summary)
-            # response = FileResponse(
-            #             path=temp_path,
-            #             filename=filename
-            #         )
+
+        bucket = storage.bucket()
+        blob = bucket.blob(path_result)
+        blob.upload_from_filename(path_result)
+
+        direct = ["/result/summary","/result/transcription","/param"]
+        for dir in direct:
+            rootdir = root_path + f"/{id}/{dir}"
+            for f in os.listdir(rootdir):
+                os.remove(os.path.join(rootdir, f))
+
         return { "filename":filename, "transcription":"", "summary":summary}
         
     elif suffix == ".mp4":
-        path_setting = f"app/static/param/{filename}"
+        path_setting = f"{root_path}/{id}/param/{filename}"
         with open(path_setting, "r", encoding="shift-jis") as f:
             d = json.load(f)
 
@@ -461,7 +533,7 @@ async def upload_file( filename : str ,upload_file: UploadFile = File(...)):
 
         text_all, transcription_all = await transcription_whisper(upload_file, d)
 
-        result = summarize(text_all)
+        result = summarize(text_all, type)
 
         summary=""
         summary+= "打合せ："+ d["title"] + "\n"
@@ -471,23 +543,43 @@ async def upload_file( filename : str ,upload_file: UploadFile = File(...)):
         summary+= result
 
 
-        filename = f"summary_{datetime.now().strftime('%Y%m%d%H%M%S')}_{upload_file.filename.replace('mp4', 'txt')}"
-        path_summary = f"app/static/result/summary/{filename}"
-        path_transcription = f"app/static/result/transcription/{filename}"
+        summary_filename = f"summary_{filename[:15]}_{upload_file.filename.replace('mp4', 'txt')}"
+        transcription_filename = f"transcription_{filename[:15]}_{upload_file.filename.replace('mp4', 'txt')}"
+        # path_summary = f"app/static/result/summary/{filename}"
+        # path_transcription = f"app/static/result/transcription/{filename}"
 
-        with open(path_summary, "w") as file:
+        save_summary_path =  root_path + f"/{id}/result/summary"
+        save_transcription_path =  root_path + f"/{id}/result/transcription"
+        os.makedirs(save_summary_path, exist_ok=True)  # ディレクトリが存在しない場合は作成
+        os.makedirs(save_transcription_path, exist_ok=True)  # ディレクトリが存在しない場合は作成
+        path_summary = f"{save_summary_path}/{summary_filename}"
+        path_transcription = f"{save_transcription_path}/{transcription_filename}"
+
+        with open(path_summary, "w", encoding="shift-jis") as file:
             file.write(summary)
 
-
-        with open(path_transcription, "w") as file:
+        with open(path_transcription, "w", encoding="shift-jis") as file:
             file.write(transcription_all) 
+
+        bucket = storage.bucket()
+        blob = bucket.blob(path_summary)
+        blob.upload_from_filename(path_summary)
+
+        blob = bucket.blob(path_transcription)
+        blob.upload_from_filename(path_transcription)
+
+        direct = ["/result/summary","/result/transcription","/param"]
+        for dir in direct:
+            rootdir = root_path + f"/{id}/{dir}"
+            for f in os.listdir(rootdir):
+                os.remove(os.path.join(rootdir, f))
 
         return { "filename":filename, "transcription":transcription_all, "summary":summary}
 
 
-@app.get("/downloadfile/{filename}")
-async def get_summary(filename:str):
-    file_path = f"app/static/result/summary/{filename}"
+@app.get("/downloadfile/{id}/{filename}")
+async def get_summary(id : str, filename:str):
+    file_path = f"{root_path}/{id}/result/summary/{filename}"
     now = datetime.now()
 
     print(file_path)
@@ -498,9 +590,10 @@ async def get_summary(filename:str):
                 )
     return response
 
-@app.get("/downloadtranscription/{filename}")
-async def get_transcription(filename:str):
-    file_path = f"app/static/result/transcription/{filename}"
+@app.get("/downloadtranscription/{id}/{filename}")
+async def get_transcription(id : str,  filename:str):
+    filename.replace("summary", "transcription")
+    file_path = f"{root_path}/{id}/result/transcription/{filename}"
     now = datetime.now()
 
     print(file_path)
@@ -512,82 +605,73 @@ async def get_transcription(filename:str):
         return response
     except:
         return "ファイルは存在しません。"
+
+@app.post("/announce")
+async def annouce(data:MailData):
+    address = data.address
+
+    # 1. Gmail APIのスコープを設定
+    SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+
+    # 2. メール本文の作成
+    def create_message(sender, to, subject, message_text):
+        message = MIMEText(message_text)
+        message['to'] = to
+        message['from'] = sender
+        message['subject'] = subject
+        encode_message = base64.urlsafe_b64encode(message.as_bytes())
+        return {'raw': encode_message.decode()}
+    # 3. メール送信の実行
+    def send_message(service, user_id, message):
+        try:
+            message = (service.users().messages().send(userId=user_id, body=message)
+                    .execute())
+            print('Message Id: %s' % message['id'])
+            return message
+        except errors.HttpError as error:
+            print('An error occurred: %s' % error)
     
-
-#作ったけど不要か。
-@app.post("/uploadsetfile/")
-async def upload_file( data:MeetingData ,upload_file: UploadFile = File(...)):
-    title = data.title
-    date = data.date
-    member_list = ""
-    for member in data.participants:
-        member_list += member + "、" 
-    purpose = data.purpose
-    try:
-        precision = data.precision
-    except:
-        precision = ""
-
-    filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_settings.json"
-    path_setting = f"app/static/param/{filename}"
-    
-    with open(path_setting, "w") as f:
-        params = {"title":title, "date":date, "member":member_list, "purpose":purpose, "precision":precision}    
-        json.dump(params, f)
-
-    print("setting",params)
-
-    summary=""
-    summary+= "打合せ："+ params["title"] + "\n"
-    summary+="日付："+ params["paramsate"] + "\n"
-    summary+="参加者："+ params["member"] + "\n"
-    summary+="目的："+ params["purpose"] + "\n"
-
-    suffix = Path(upload_file.filename).suffix
-    if suffix == ".txt":
-        print('filename:' ,upload_file.filename)
-        with tempfile.NamedTemporaryFile(delete=True,  suffix=suffix) as temp_file:
-            shutil.copyfileobj(upload_file.file, temp_file)
-            temp_file.seek(0)
-            temp_path = Path(temp_file.name)
-
-            content = process_text(temp_file.read())
-            print("content:",content)
-            print("Path:",temp_path)
-
-            result = summarize(content)
-        
-        summary+= result
-
-        filename = f"summary_{datetime.now().strftime('%Y%m%d%H%M%S')}_{upload_file.filename}"
-        path_result = f"app/static/result/summary/{filename}"
-
-        with open(path_result, "w") as file:
-            file.write(summary)
-            # response = FileResponse(
-            #             path=temp_path,
-            #             filename=filename
-            #         )
-        return { "filename":filename, "transcription":"", "summary":summary}
-        
-    elif suffix == ".mp4":
-        
-        print("setting",params)
-
-        text_all, transcription_all = await transcription_whisper(upload_file, params)
-
-        result = summarize(text_all)
-        summary+= result
-
-        filename = f"summary_{datetime.now().strftime('%Y%m%d%H%M%S')}_{upload_file.filename.replace('mp4', 'txt')}"
-        path_summary = f"app/static/result/summary/{filename}"
-        path_transcription = f"app/static/result/transcription/{filename}"
-
-        with open(path_summary, "w") as file:
-            file.write(summary)
-
-
-        with open(path_transcription, "w") as file:
-            file.write(transcription_all) 
-
-        return { "filename":filename, "transcription":transcription_all, "summary":summary}
+    # 4. アクセストークンの取得
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            mail_client_id = os.getenv("mail_client_id")
+            mail_project_id = os.getenv("mail_project_id")
+            mail_auth_uri = os.getenv("mail_auth_uri")
+            mail_token_uri = os.getenv("mail_mail_token_uri")
+            mail_auth_provider_x509_cert_url = os.getenv("mail_auth_provider_x509_cert_url")
+            mail_client_secret = os.getenv("mail_client_secret")
+ #           mail_redirect_uris = os.getenv("mail_redirect_uri")
+            
+            # 変数を統合してJSON文字列に戻す
+            client_info = {
+                "installed": {
+                    "client_id": mail_client_id,
+                    "project_id": mail_project_id,
+                    "auth_uri": mail_auth_uri,
+                    "token_uri": mail_token_uri,
+                    "auth_provider_x509_cert_url": mail_auth_provider_x509_cert_url,
+                    "client_secret": mail_client_secret,
+ #                   "redirect_uris": list(mail_redirect_uris)
+                }
+            }
+            print("client_info",client_info)
+            flow = InstalledAppFlow.from_client_config(
+            client_info , SCOPES)
+            creds = flow.run_local_server()
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    service = build('gmail', 'v1', credentials=creds)
+    # 6. メール本文の作成
+    sender = 'giziroku.tech0@gmail.com'
+    to = address
+    subject = '議事録の作成が完了しました'
+    message_text = '議事録の作成が完了しました。HPからダウンロードしてください'
+    message = create_message(sender, to, subject, message_text)
+    # 7. Gmail APIを呼び出してメール送信
+    send_message(service, 'me', message)
