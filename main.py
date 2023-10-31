@@ -238,7 +238,7 @@ def summarize(text,type="all"):
     
     # 回答の生成
     response = openai.ChatCompletion.create(
-        engine=gpt_model,
+        engine='gpt-4',
         messages=[
             {"role": "user", "content": prompt},
         ],
